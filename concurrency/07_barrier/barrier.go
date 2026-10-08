@@ -13,7 +13,7 @@ type Barrier struct {
 }
 
 func New(n int) *Barrier {
-	if n < 1 || n > math.MaxInt {
+	if n < 1 || n > math.MaxUint32 {
 		panic("barrier: invalid initial permits")
 	}
 	return &Barrier{need: uint32(n)}

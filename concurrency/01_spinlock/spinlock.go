@@ -43,7 +43,9 @@ func (s *TTAS) TryLock() bool {
 }
 
 func (s *TTAS) Unlock() {
-	if !s.locked.Swap(false) { {
-		panic("unlock without lock")
+	if !s.locked.Swap(false) {
+		{
+			panic("unlock without lock")
+		}
 	}
 }
