@@ -2,46 +2,104 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
+	"io"
 	"net"
+	"net/netip"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
 
 var qtypes = map[string]uint16{"A": 1, "NS": 2, "CNAME": 5, "MX": 15, "TXT": 16, "AAAA": 28}
 
-var errBad = errors.New("bad message")
+var (
+	errBad     = errors.New("bad message")
+	errInput   = errors.New("bad input")
+	errTimeout = errors.New("timeout")
+)
+
+const classIN = 1
 
 type answer struct {
-	line string
-	ttl  uint32
+	typ string
+	val string
+	ttl uint32
+}
+
+type response struct {
+	rcode     int
+	truncated bool
+	answers   []answer
 }
 
 type entry struct {
-	lines []string
-	exp   time.Time
+	answers []answer
+	exp     time.Time
 }
 
-func buildQuery(id uint16, name string, qt uint16) []byte {
-	b := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
-	for _, l := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+type resolver struct {
+	conn  net.Conn
+	buf   []byte
+	cache map[string]entry
+}
+
+func warnf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "warning: "+format+"\n", args...)
+}
+
+func escapeBytes(b []byte, inName bool) string {
+	var sb strings.Builder
+	for _, c := range b {
+		switch {
+		case c == '\\':
+			sb.WriteString(`\\`)
+		case inName && c == '.':
+			sb.WriteString(`\.`)
+		case c < 0x20 || c > 0x7e || (inName && c == ' '):
+			fmt.Fprintf(&sb, `\%03d`, c)
+		default:
+			sb.WriteByte(c)
+		}
+	}
+	return sb.String()
+}
+
+func encodeName(name string) ([]byte, error) {
+	if name == "." {
+		return []byte{0}, nil
+	}
+	trimmed := strings.TrimSuffix(name, ".")
+	if trimmed == "" {
+		return nil, errors.New("пустое имя")
+	}
+	var b []byte
+	for _, l := range strings.Split(trimmed, ".") {
 		if l == "" {
-			continue
+			return nil, fmt.Errorf("пустая метка в имени %q", name)
+		}
+		if len(l) > 63 {
+			return nil, fmt.Errorf("метка длиннее 63 байт в имени %q", name)
 		}
 		b = append(b, byte(len(l)))
 		b = append(b, l...)
 	}
-	b = append(b, 0, byte(qt>>8), byte(qt), 0, 1)
-	return b
+	b = append(b, 0)
+	if len(b) > 255 {
+		return nil, fmt.Errorf("имя %q длиннее 255 байт", name)
+	}
+	return b, nil
 }
 
-// readName читает имя (с учётом сжатия) и возвращает его вместе со смещением
-// байта, следующего за именем в исходном месте.
+func buildQuery(id uint16, wireName []byte, qt uint16) []byte {
+	b := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
+	b = append(b, wireName...)
+	return append(b, byte(qt>>8), byte(qt), 0, classIN)
+}
+
 func readName(msg []byte, off int) (string, int, error) {
 	var labels []string
 	next := -1
@@ -77,139 +135,134 @@ func readName(msg []byte, off int) (string, int, error) {
 			if off+1+l > len(msg) {
 				return "", 0, errBad
 			}
-			labels = append(labels, string(msg[off+1:off+1+l]))
+			labels = append(labels, escapeBytes(msg[off+1:off+1+l], true))
 			off += 1 + l
 		}
 	}
 }
 
-func fmtIPv6(b []byte) string {
-	var g [8]uint16
-	for i := range g {
-		g[i] = binary.BigEndian.Uint16(b[2*i:])
+func nameWithin(msg []byte, off, end int) (string, error) {
+	n, next, err := readName(msg, off)
+	if err != nil {
+		return "", err
 	}
-	bestS, bestL := -1, 0
-	for i := 0; i < 8; {
-		if g[i] != 0 {
-			i++
-			continue
-		}
-		j := i
-		for j < 8 && g[j] == 0 {
-			j++
-		}
-		if j-i > bestL {
-			bestS, bestL = i, j-i
-		}
-		i = j
+	if next > end {
+		return "", fmt.Errorf("%w: имя выходит за границы rdata", errBad)
 	}
-	if bestL < 2 {
-		bestS = -1
-	}
-	var sb strings.Builder
-	for i := 0; i < 8; i++ {
-		if i == bestS {
-			sb.WriteString("::")
-			i += bestL - 1
-			continue
-		}
-		if sb.Len() > 0 && !strings.HasSuffix(sb.String(), ":") {
-			sb.WriteByte(':')
-		}
-		sb.WriteString(strconv.FormatUint(uint64(g[i]), 16))
-	}
-	return sb.String()
+	return n, nil
 }
 
-func parse(msg []byte) (int, []answer, error) {
-	if len(msg) < 12 {
-		return 0, nil, errBad
+func parseRData(msg []byte, typ uint16, rd, end int) (string, string, error) {
+	rdlen := end - rd
+	switch typ {
+	case 1:
+		if rdlen != 4 {
+			return "", "", fmt.Errorf("A: rdlength %d вместо 4", rdlen)
+		}
+		return "A", netip.AddrFrom4([4]byte(msg[rd:end])).String(), nil
+	case 28:
+		if rdlen != 16 {
+			return "", "", fmt.Errorf("AAAA: rdlength %d вместо 16", rdlen)
+		}
+		return "AAAA", netip.AddrFrom16([16]byte(msg[rd:end])).String(), nil
+	case 2, 5:
+		n, err := nameWithin(msg, rd, end)
+		if err != nil {
+			return "", "", err
+		}
+		if typ == 5 {
+			return "CNAME", n, nil
+		}
+		return "NS", n, nil
+	case 15:
+		if rdlen < 3 {
+			return "", "", fmt.Errorf("MX: rdlength %d слишком мал", rdlen)
+		}
+		pref := binary.BigEndian.Uint16(msg[rd:])
+		n, err := nameWithin(msg, rd+2, end)
+		if err != nil {
+			return "", "", err
+		}
+		return "MX", fmt.Sprintf("%d %s", pref, n), nil
+	case 16:
+		var sb strings.Builder
+		p := rd
+		for p < end {
+			l := int(msg[p])
+			p++
+			if p+l > end {
+				return "", "", fmt.Errorf("TXT: строка выходит за границы rdata")
+			}
+			sb.WriteString(escapeBytes(msg[p:p+l], false))
+			p += l
+		}
+		return "TXT", sb.String(), nil
 	}
-	rcode := int(msg[3] & 0x0f)
+	return "", "", nil
+}
+
+func parse(msg []byte) (response, error) {
+	var resp response
+	if len(msg) < 12 {
+		return resp, errBad
+	}
+	if msg[2]&0x80 == 0 {
+		return resp, fmt.Errorf("%w: QR=0, это не ответ", errBad)
+	}
+	resp.truncated = msg[2]&0x02 != 0
+	resp.rcode = int(msg[3] & 0x0f)
 	qd := int(binary.BigEndian.Uint16(msg[4:6]))
 	an := int(binary.BigEndian.Uint16(msg[6:8]))
+
 	off := 12
 	for i := 0; i < qd; i++ {
 		_, next, err := readName(msg, off)
 		if err != nil {
-			return 0, nil, err
+			return resp, err
+		}
+		if next+4 > len(msg) {
+			return resp, errBad
 		}
 		off = next + 4
 	}
-	var res []answer
 	for i := 0; i < an; i++ {
 		_, next, err := readName(msg, off)
 		if err != nil {
-			return 0, nil, err
+			return resp, err
 		}
 		off = next
 		if off+10 > len(msg) {
-			return 0, nil, errBad
+			return resp, errBad
 		}
 		typ := binary.BigEndian.Uint16(msg[off:])
+		class := binary.BigEndian.Uint16(msg[off+2:])
 		ttl := binary.BigEndian.Uint32(msg[off+4:])
 		rdlen := int(binary.BigEndian.Uint16(msg[off+8:]))
 		rd := off + 10
 		end := rd + rdlen
 		if end > len(msg) {
-			return 0, nil, errBad
+			return resp, errBad
 		}
 		off = end
-		var tname, val string
-		switch typ {
-		case 1:
-			if rdlen != 4 {
-				continue
-			}
-			tname = "A"
-			val = fmt.Sprintf("%d.%d.%d.%d", msg[rd], msg[rd+1], msg[rd+2], msg[rd+3])
-		case 28:
-			if rdlen != 16 {
-				continue
-			}
-			tname = "AAAA"
-			val = fmtIPv6(msg[rd:end])
-		case 2, 5:
-			n, _, err := readName(msg, rd)
-			if err != nil {
-				return 0, nil, err
-			}
-			tname = "NS"
-			if typ == 5 {
-				tname = "CNAME"
-			}
-			val = n
-		case 15:
-			if rdlen < 3 {
-				return 0, nil, errBad
-			}
-			pref := binary.BigEndian.Uint16(msg[rd:])
-			n, _, err := readName(msg, rd+2)
-			if err != nil {
-				return 0, nil, err
-			}
-			tname = "MX"
-			val = fmt.Sprintf("%d %s", pref, n)
-		case 16:
-			var sb strings.Builder
-			p := rd
-			for p < end {
-				l := int(msg[p])
-				p++
-				if p+l > end {
-					return 0, nil, errBad
-				}
-				sb.Write(msg[p : p+l])
-				p += l
-			}
-			tname = "TXT"
-			val = sb.String()
-		default:
+
+		if class != classIN {
+			warnf("пропущена запись типа %d: класс %d не IN", typ, class)
 			continue
 		}
-		res = append(res, answer{fmt.Sprintf("answer %s %s %d", tname, val, ttl), ttl})
+		tname, val, err := parseRData(msg, typ, rd, end)
+		if err != nil {
+			warnf("пропущена битая запись типа %d: %v", typ, err)
+			continue
+		}
+		if tname == "" {
+			continue
+		}
+		if ttl&0x80000000 != 0 {
+			ttl = 0
+		}
+		resp.answers = append(resp.answers, answer{tname, val, ttl})
 	}
-	return rcode, res, nil
+	return resp, nil
 }
 
 func rcodeName(rc int) string {
@@ -228,27 +281,162 @@ func rcodeName(rc int) string {
 	return fmt.Sprintf("RCODE%d", rc)
 }
 
-func ask(conn net.Conn, name string, qt uint16) (int, []answer, bool) {
-	id := uint16(rand.Intn(65536))
-	if _, err := conn.Write(buildQuery(id, name, qt)); err != nil {
-		return 0, nil, false
+func newID() (uint16, error) {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, err
 	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 65535)
+	return binary.BigEndian.Uint16(b[:]), nil
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + 32
+	}
+	return c
+}
+
+func questionMatches(query, msg []byte) bool {
+	q := query[12:]
+	if len(msg) < 12+len(q) || binary.BigEndian.Uint16(msg[4:6]) != 1 {
+		return false
+	}
+	for i, c := range q {
+		if lowerASCII(c) != lowerASCII(msg[12+i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *resolver) ask(wireName []byte, qt uint16) (response, error) {
+	id, err := newID()
+	if err != nil {
+		return response{}, fmt.Errorf("генерация ID: %w", err)
+	}
+	query := buildQuery(id, wireName, qt)
+	if _, err := r.conn.Write(query); err != nil {
+		return response{}, fmt.Errorf("отправка запроса: %w", err)
+	}
+	if err := r.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return response{}, fmt.Errorf("установка дедлайна: %w", err)
+	}
 	for {
-		n, err := conn.Read(buf)
+		n, err := r.conn.Read(r.buf)
 		if err != nil {
-			return 0, nil, false
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				return response{}, errTimeout
+			}
+			return response{}, fmt.Errorf("чтение ответа: %w", err)
 		}
-		if n < 12 || binary.BigEndian.Uint16(buf[0:2]) != id {
+		msg := r.buf[:n]
+		if n < 12 || binary.BigEndian.Uint16(msg[0:2]) != id {
 			continue
 		}
-		rc, ans, err := parse(buf[:n])
-		if err != nil {
+		if !questionMatches(query, msg) {
+			warnf("ответ с нашим ID, но с другим вопросом, игнорируем")
 			continue
 		}
-		return rc, ans, true
+		resp, err := parse(msg)
+		if err != nil {
+			warnf("не удалось разобрать ответ: %v", err)
+			continue
+		}
+		return resp, nil
 	}
+}
+
+func printBlock(status string, answers []answer) {
+	fmt.Println("status", status)
+	for _, a := range answers {
+		fmt.Printf("answer %s %s %d\n", a.typ, a.val, a.ttl)
+	}
+	fmt.Println("end")
+}
+
+func (r *resolver) store(key string, resp response) {
+	if resp.rcode != 0 || resp.truncated || len(resp.answers) == 0 {
+		return
+	}
+	minTTL := resp.answers[0].ttl
+	for _, a := range resp.answers {
+		if a.ttl < minTTL {
+			minTTL = a.ttl
+		}
+	}
+	if minTTL > 0 {
+		r.cache[key] = entry{resp.answers, time.Now().Add(time.Duration(minTTL) * time.Second)}
+	}
+}
+
+func (r *resolver) handle(name, tstr string) error {
+	qt, ok := qtypes[strings.ToUpper(tstr)]
+	if !ok {
+		return fmt.Errorf("%w: неподдерживаемый тип записи %q", errInput, tstr)
+	}
+	wire, err := encodeName(name)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errInput, err)
+	}
+
+	fmt.Println("query", name, tstr)
+	key := strings.ToLower(strings.TrimSuffix(name, ".")) + "|" + strings.ToUpper(tstr)
+
+	if e, hit := r.cache[key]; hit {
+		if time.Now().Before(e.exp) {
+			printBlock("NOERROR", e.answers)
+			return nil
+		}
+		delete(r.cache, key)
+	}
+
+	resp, err := r.ask(wire, qt)
+	if errors.Is(err, errTimeout) {
+		printBlock("TIMEOUT", nil)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if resp.truncated {
+		warnf("ответ на %s %s обрезан (TC), результат неполный и не кэшируется", name, tstr)
+	}
+	printBlock(rcodeName(resp.rcode), resp.answers)
+	r.store(key, resp)
+	return nil
+}
+
+func (r *resolver) run(in io.Reader) int {
+	code := 0
+	sc := bufio.NewScanner(in)
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) == 0 {
+			continue
+		}
+		if len(f) < 2 {
+			fmt.Fprintf(os.Stderr, "error: строка %q пропущена: нужны имя и тип\n", sc.Text())
+			code = 2
+			continue
+		}
+		err := r.handle(f[0], f[1])
+		switch {
+		case err == nil:
+		case errors.Is(err, errInput):
+			fmt.Fprintln(os.Stderr, "error:", err)
+			code = 2
+		case errors.Is(err, errTimeout):
+			return 1
+		default:
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 2
+		}
+	}
+	if err := sc.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "error: чтение stdin:", err)
+		return 2
+	}
+	return code
 }
 
 func main() {
@@ -256,67 +444,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: run.sh <addr> <port>")
 		os.Exit(2)
 	}
-	rand.Seed(time.Now().UnixNano())
 	conn, err := net.Dial("udp", net.JoinHostPort(os.Args[1], os.Args[2]))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	defer conn.Close()
-
-	cache := map[string]entry{}
-	sc := bufio.NewScanner(os.Stdin)
-	for sc.Scan() {
-		f := strings.Fields(sc.Text())
-		if len(f) < 2 {
-			continue
-		}
-		name, tstr := f[0], f[1]
-		fmt.Println("query", name, tstr)
-		qt, ok := qtypes[strings.ToUpper(tstr)]
-		if !ok {
-			fmt.Println("status FORMERR")
-			fmt.Println("end")
-			continue
-		}
-		key := strings.ToLower(strings.TrimSuffix(name, ".")) + "|" + strings.ToUpper(tstr)
-
-		if e, hit := cache[key]; hit {
-			if time.Now().Before(e.exp) {
-				fmt.Println("status NOERROR")
-				for _, l := range e.lines {
-					fmt.Println(l)
-				}
-				fmt.Println("end")
-				continue
-			}
-			delete(cache, key)
-		}
-
-		rc, ans, got := ask(conn, name, qt)
-		if !got {
-			fmt.Println("status TIMEOUT")
-			fmt.Println("end")
-			os.Exit(1)
-		}
-		fmt.Println("status", rcodeName(rc))
-		for _, a := range ans {
-			fmt.Println(a.line)
-		}
-		fmt.Println("end")
-
-		if rc == 0 && len(ans) > 0 {
-			minTTL := ans[0].ttl
-			lines := make([]string, len(ans))
-			for i, a := range ans {
-				lines[i] = a.line
-				if a.ttl < minTTL {
-					minTTL = a.ttl
-				}
-			}
-			if minTTL > 0 {
-				cache[key] = entry{lines, time.Now().Add(time.Duration(minTTL) * time.Second)}
-			}
-		}
-	}
+	r := &resolver{conn: conn, buf: make([]byte, 65535), cache: map[string]entry{}}
+	code := r.run(os.Stdin)
+	conn.Close()
+	os.Exit(code)
 }

@@ -1,2 +1,3 @@
 #!/bin/sh
-exec go run main.go "$@"
+cd "$(dirname "$0")"
+exec ./prog "$@"
