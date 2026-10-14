@@ -31,10 +31,11 @@ def run(args=(), stdin="", timeout=30):
             % TASK_DIR.name)
     _build()
     env = dict(os.environ, PYTHONUNBUFFERED="1")
+    # на винде шалило из-за \r\r\n
     r = subprocess.run(["sh", str(script), *map(str, args)], cwd=TASK_DIR,
-                       input=stdin, capture_output=True, text=True,
+                       input=stdin.encode("latin-1"), capture_output=True,   
                        timeout=timeout, env=env)
-    return r.returncode, r.stdout, r.stderr
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
 
 
 def fields(stdout):
