@@ -16,7 +16,6 @@ const (
 	headEnd     = crlf + crlf
 )
 
-// Причины отказа: в stdout попадает только имя, подробности — в stderr.
 var (
 	errBadStartLine   = errors.New("bad_start_line")
 	errBadHeader      = errors.New("bad_header")
@@ -95,7 +94,6 @@ func (m *message) parseStatusLine(line string) error {
 	return nil
 }
 
-// splitHead отделяет заголовочную часть от тела по первой пустой строке.
 func splitHead(rest []byte) (head, body []byte, err error) {
 	if bytes.HasPrefix(rest, []byte(crlf)) {
 		return nil, rest[len(crlf):], nil
@@ -146,7 +144,6 @@ func (m *message) isChunked() bool {
 	return last == "chunked"
 }
 
-// readBody определяет границы тела: chunked, затем Content-Length, иначе пусто.
 func (m *message) readBody(rest []byte) ([]byte, error) {
 	if m.isChunked() {
 		return readChunked(rest)
@@ -169,8 +166,6 @@ func parseLength(s string) (uint64, error) {
 	if s == "" || !allBytes(s, isDigit) {
 		return 0, fmt.Errorf("%w: Content-Length %q не число", errBadHeader, s)
 	}
-	// При переполнении ParseUint возвращает максимум: «слишком длинное тело»
-	// всё равно окажется больше входа, то есть incomplete_body.
 	n, err := strconv.ParseUint(s, 10, 63)
 	if err != nil && !errors.Is(err, strconv.ErrRange) {
 		return 0, fmt.Errorf("%w: Content-Length %q: %v", errBadHeader, s, err)
@@ -200,7 +195,6 @@ func readChunked(data []byte) ([]byte, error) {
 	}
 }
 
-// parseChunkSize читает длину части; расширения после «;» игнорируются.
 func parseChunkSize(line string) (uint64, error) {
 	s, _, _ := strings.Cut(line, ";")
 	s = strings.Trim(s, " \t")
@@ -239,7 +233,6 @@ func (m *message) render() string {
 	return b.String()
 }
 
-// reasonOf возвращает имя причины для строки «error <причина>».
 func reasonOf(err error) string {
 	for _, e := range parseErrors {
 		if errors.Is(err, e) {
